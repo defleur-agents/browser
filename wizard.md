@@ -3,8 +3,9 @@ wizard: 0.2
 id: browser
 name: Browser
 type: service
+category: system
 version: 155.0.8059.40
-summary: Shared headless Chromium with a DevTools/Puppeteer endpoint for other apps.
+summary: A shared headless Chrome for rendering and web tasks.
 license: WTFPL
 source: https://github.com/oscarhenrycollins/browser
 runtime:
@@ -22,4 +23,4 @@ provides:
 
 # Browser
 
-Shared headless Chromium with a DevTools/Puppeteer endpoint for other apps.
+A shared headless Chrome for rendering and web tasks.
