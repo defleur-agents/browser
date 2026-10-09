@@ -6,6 +6,7 @@ type: service
 category: system
 version: 155.0.8059.40
 summary: A shared headless Chrome for rendering and web tasks.
+icon: icon.png
 license: WTFPL
 source: https://github.com/oscarhenrycollins/browser
 runtime:
