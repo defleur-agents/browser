@@ -4,6 +4,7 @@ id: browser
 name: Browser
 type: service
 category: system
+tags: [research, automation]
 version: 155.0.8059.40
 summary: A shared headless Chrome for rendering and web tasks.
 icon: icon.png
