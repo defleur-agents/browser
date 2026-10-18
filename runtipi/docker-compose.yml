@@ -1,6 +1,8 @@
 # browser: the main service is a small MCP front (mcp/front.py + mcp/tools.py, inlined by mcp/inline.py).
-# It serves the app's MCP at /mcp and passes every other request unchanged to browser-engine,
-# the unmodified upstream container, which is reachable only on this app's private network.
+# It serves the app's MCP at /mcp, the owner's handoff viewer at /handoff/ (capability link only) and
+# passes every other request unchanged to browser-engine's DevTools port (direct callers only).
+# browser-engine (engine/Dockerfile) runs one headful Chromium on Xvfb; during a handoff it also runs
+# x11vnc (container loopback) and websockify (needs the front's per-handoff credential).
 services:
   browser:
     image: python:3.12-alpine@sha256:1b668429b3511ab407d8e00648891631b0b1a4d7e15e3ca70f38ab5b91ad4ab4
@@ -14,7 +16,8 @@ services:
     mem_limit: 256m
     environment:
       WIZARD_APP: browser
-      APP_VERSION: 155.0.8059.40
+      APP_VERSION: 2.0.0
+      BROWSER_PUBLIC_URL: ${BROWSER_PUBLIC_URL:-}
       FRONT_PORT: '9222'
       UPSTREAM_HOST: browser-engine
       UPSTREAM_PORT: '9222'
@@ -53,6 +56,10 @@ services:
       MAX_BODY = 1 << 20
       TOOLS = {}
       REQUEST = contextvars.ContextVar("request", default={})  # headers of the current /mcp call
+      # An app's tools.py may set ROUTE = fn(method, target, headers) to route a non-/mcp request itself.
+      # It returns None (default pass-through), ("respond", code, obj, extra_headers) or
+      # ("proxy", host, port, new_target, drop_header_names, add_header_lines).
+      ROUTE = None
 
 
       def tool(name, description, props=None, required=()):
@@ -110,13 +117,15 @@ services:
           return {"jsonrpc": "2.0", "id": i, "result": r}
 
 
-      REASONS = {200: "OK", 202: "Accepted", 400: "Bad Request", 404: "Not Found", 405: "Method Not Allowed",
-                 401: "Unauthorized", 413: "Payload Too Large", 502: "Bad Gateway"}
+      REASONS = {200: "OK", 202: "Accepted", 301: "Moved Permanently", 400: "Bad Request", 401: "Unauthorized",
+                 403: "Forbidden", 404: "Not Found", 405: "Method Not Allowed", 409: "Conflict", 413: "Payload Too Large",
+                 502: "Bad Gateway"}
 
 
       async def respond(writer, code, obj=None, extra=""):
           body = b"" if obj is None else json.dumps(obj).encode()
-          head = "HTTP/1.1 %d %s\r\nContent-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n%s\r\n" % (
+          head = ("HTTP/1.1 %d %s\r\nContent-Type: application/json\r\nContent-Length: %d\r\nCache-Control: no-store\r\n"
+                  "Connection: close\r\n%s\r\n") % (
               code, REASONS.get(code, "OK"), len(body), extra)
           writer.write(head.encode() + body)
           try:
@@ -182,15 +191,33 @@ services:
           path = parts[1].split("?", 1)[0] if len(parts) >= 3 else ""
           if path == MCP_PATH:
               return await mcp(reader, writer, parts[0], rest)
-          if not UP_HOST:
+          host, port = UP_HOST, UP_PORT
+          lines = head.decode("latin-1").split("\r\n")
+          if ROUTE and len(parts) >= 3:
+              headers = {}
+              for l in lines[1:]:
+                  if ":" in l:
+                      k, v = l.split(":", 1)
+                      headers[k.strip().lower()] = v.strip()
+              try:
+                  r = ROUTE(parts[0], parts[1], headers)
+              except Exception as e:  # a routing bug must not take the proxy down
+                  r = ("respond", 502, {"error": "%s: %s" % (type(e).__name__, e)}, "")
+              if r and r[0] == "respond":
+                  return await respond(writer, *r[1:])
+              if r and r[0] == "proxy":
+                  _, host, port, target, drop, add = r
+                  lines = ["%s %s %s" % (parts[0], target, parts[2])] + [
+                      l for l in lines[1:] if l and l.split(":", 1)[0].strip().lower() not in drop] + list(add) + ["", ""]
+                  head = "\r\n".join(lines).encode("latin-1")
+          if not host:
               return await respond(writer, 404, {"error": "not found"})
           try:
-              ur, uw = await asyncio.open_connection(UP_HOST, UP_PORT)
+              ur, uw = await asyncio.open_connection(host, port)
           except OSError:
               return await respond(writer, 502, {"error": "%s is starting or not reachable" % APP})
           # One request per proxied connection (unless it is an upgrade such as a WebSocket), so a
           # later /mcp request can never ride an upstream keep-alive connection.
-          lines = head.decode("latin-1").split("\r\n")
           if not any(l.lower().startswith("upgrade:") for l in lines):
               lines = [l for l in lines if l and not l.lower().startswith(("connection:", "keep-alive:"))]
               head = ("\r\n".join(lines) + "\r\nConnection: close\r\n\r\n").encode("latin-1")
@@ -316,12 +343,13 @@ services:
                   pass
 
 
-      @tool("browser_status", "Check the shared Browser is up: Chromium version, open tabs, and the DevTools address other apps use.")
+      @tool("browser_status", "Check the shared Browser is up: Chromium version, open tabs, the DevTools address other apps use, and any open human handoff.")
       def browser_status():
           v = _devtools("/json/version")
           tabs = [{"id": t.get("id"), "url": t.get("url"), "title": t.get("title")} for t in _devtools("/json/list") if t.get("type") == "page"]
           return {"ok": True, "browser": v.get("Browser"), "tabs": tabs,
-                  "devtools_for_apps": "http://browser:9222 (Puppeteer/Playwright connect over the Runtipi network)"}
+                  "devtools_for_apps": "http://browser:9222 (Puppeteer/Playwright connect over the Runtipi network)",
+                  "handoff": _handoff_public()}
 
 
       @tool("read_page", "Open a URL in the shared headless browser (JavaScript runs) and return the page title and visible text.",
@@ -353,6 +381,227 @@ services:
           return _with_page(url, shot, width, height, wait_ms)
 
 
+
+      # ---- human handoff: the owner takes over this same live browser from a phone ----
+
+      import hmac
+      import secrets
+      import threading
+
+      CONTROL_PORT = int(os.environ.get("ENGINE_CONTROL_PORT", "6081"))
+      VNC_WS_PORT = int(os.environ.get("ENGINE_VNC_WS_PORT", "6080"))
+      PUBLIC_URL = os.environ.get("BROWSER_PUBLIC_URL", "").strip().rstrip("/")
+      HANDOFF_PREFIX = "/handoff"
+      COOKIE = "browser_handoff"
+      PURPOSES = ("captcha", "login", "otp", "consent", "payment", "verification", "other")
+      PROXY_HEADERS = ("x-forwarded-for", "x-forwarded-host", "x-forwarded-proto", "forwarded", "x-real-ip", "via",
+                       "tailscale-user-login", "tailscale-user-name", "tailscale-headers-info")
+      HANDOFF = {}
+      HANDOFF_LOCK = threading.Lock()
+      _ALNUM = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+
+
+      def _secret(n):
+          return "".join(secrets.choice(_ALNUM) for _ in range(n))
+
+
+      def _engine(method, path, obj=None, timeout=30):
+          url = "http://%s:%d%s" % (up_addr(), CONTROL_PORT, path)
+          data = None if obj is None else json.dumps(obj).encode()
+          req = urllib.request.Request(url, data=data, method=method, headers={"Content-Type": "application/json"})
+          try:
+              with urllib.request.urlopen(req, timeout=timeout) as r:
+                  return json.loads(r.read() or b"{}")
+          except urllib.error.HTTPError as e:
+              try:
+                  detail = json.loads(e.read() or b"{}").get("error")
+              except ValueError:
+                  detail = None
+              raise RuntimeError("browser engine: %s" % (detail or e.code))
+
+
+      def _active():
+          """The current handoff, or {} once it has expired or the engine has dropped it."""
+          h = HANDOFF
+          if not h or time.time() >= h["expires_at"]:
+              return {}
+          return h
+
+
+      def _link(h, base_url=None):
+          base = (base_url or PUBLIC_URL).strip().rstrip("/")
+          if base.endswith(HANDOFF_PREFIX):
+              base = base[: -len(HANDOFF_PREFIX)]
+          path = HANDOFF_PREFIX + "/#" + h["token"]
+          return (base + path) if base else None, path
+
+
+      def _handoff_public(h=None, include_link=False):
+          h = h if h is not None else _active()
+          if not h:
+              return {"active": False}
+          out = {"active": True, "session_id": h["session_id"], "purpose": h["purpose"], "note": h["note"],
+                 "tab_id": h["tab_id"], "started_at": int(h["started_at"]), "expires_at": int(h["expires_at"]),
+                 "expires_in_s": max(0, int(h["expires_at"] - time.time())),
+                 "owner_opened": bool(h.get("opened_at")), "owner_last_seen_s_ago":
+                     int(time.time() - h["seen_at"]) if h.get("seen_at") else None}
+          if include_link:
+              url, path = _link(h, h.get("base_url"))
+              out["handoff_url"] = url
+              out["handoff_path"] = path
+          return out
+
+
+      def _page_tabs():
+          return [t for t in _devtools("/json/list") if t.get("type") == "page"]
+
+
+      def _tab_summary(tab_id):
+          for t in _page_tabs():
+              if t.get("id") == tab_id:
+                  return {"id": tab_id, "url": t.get("url"), "title": t.get("title")}
+          return None
+
+
+      @tool("start_handoff",
+            "Hand this live browser to the owner on their phone for a step only a human should do (CAPTCHA, one-time code, "
+            "login, consent, payment, identity check). Optionally opens a URL first. Returns a private link to send the owner; "
+            "the agent keeps the same tabs, cookies and session and resumes after the owner says done. Calling it again while a "
+            "handoff is open returns the same link (pass replace=true for a fresh link).",
+            {"url": {"type": "string", "description": "http(s) page to open in a new focused tab first (optional)"},
+             "tab_id": {"type": "string", "description": "Existing tab to show the owner instead (from browser_status)"},
+             "purpose": {"type": "string", "enum": list(PURPOSES), "description": "Why the human is needed (default other)"},
+             "note": {"type": "string", "description": "One short line shown in status, e.g. 'Solve the CAPTCHA on the signup form'"},
+             "ttl_s": {"type": "integer", "description": "Link lifetime in seconds, 60-3600 (default 900)"},
+             "base_url": {"type": "string", "description": "Owner-reachable address of this Browser app (its view url, e.g. "
+                                                           "https://box.tailnet.ts.net:8793); defaults to BROWSER_PUBLIC_URL"},
+             "replace": {"type": "boolean", "description": "Revoke an open handoff and issue a new link"}})
+      def start_handoff(url=None, tab_id=None, purpose="other", note="", ttl_s=900, base_url=None, replace=False):
+          purpose = purpose if purpose in PURPOSES else "other"
+          ttl = max(60, min(int(ttl_s or 900), 3600))
+          if base_url and urllib.parse.urlparse(str(base_url)).scheme not in ("http", "https"):
+              raise ValueError("base_url must be an http(s) address")
+          with HANDOFF_LOCK:
+              h = _active()
+              engine_state = _engine("GET", "/session")
+              if h and engine_state.get("active") and not replace:
+                  if base_url:
+                      h["base_url"] = base_url
+                  return {"ok": True, "reused": True, **_handoff_public(h, include_link=True),
+                          "tab": _tab_summary(h["tab_id"]), "send_to_owner": _owner_message(h)}
+              if url:
+                  tab = _devtools("/json/new?" + urllib.parse.quote(_check_url(url), safe=""), "PUT")
+                  tab_id = tab["id"]
+              elif tab_id:
+                  if not _tab_summary(tab_id):
+                      raise ValueError("no open tab with id %s" % tab_id)
+              else:
+                  tabs = _page_tabs()
+                  if not tabs:
+                      tab_id = _devtools("/json/new?about:blank", "PUT")["id"]
+                  else:
+                      tab_id = tabs[0]["id"]
+              _devtools("/json/activate/" + tab_id)
+              token, ws_secret = _secret(32), _secret(32)
+              _engine("POST", "/session", {"password": token[:8], "ws_secret": ws_secret, "ttl": ttl})
+              now = time.time()
+              HANDOFF.clear()
+              HANDOFF.update(session_id="ho_" + _secret(10), token=token, ws_secret=ws_secret, purpose=purpose,
+                             note=str(note or "")[:200], tab_id=tab_id, started_at=now, expires_at=now + ttl,
+                             base_url=base_url, opened_at=None, seen_at=None)
+              h = HANDOFF
+              out = {"ok": True, "reused": False, **_handoff_public(h, include_link=True), "tab": _tab_summary(tab_id),
+                     "send_to_owner": _owner_message(h)}
+              if not out["handoff_url"]:
+                  out["warning"] = ("No owner-reachable address is configured. Prefix handoff_path with the Browser app's "
+                                    "view address (wizard apps list --json: view.url, without /handoff/) or pass base_url.")
+              return out
+
+
+      def _owner_message(h):
+          url, path = _link(h, h.get("base_url"))
+          what = {"captcha": "solve a CAPTCHA", "login": "sign in", "otp": "enter a one-time code", "consent": "approve a consent step",
+                  "payment": "confirm a payment", "verification": "verify your identity"}.get(h["purpose"], "finish a step")
+          return "I need you to %s in my browser%s: %s  Reply done when finished." % (
+              what, (" (" + h["note"] + ")") if h["note"] else "", url or path)
+
+
+      @tool("handoff_status",
+            "Is a human handoff open, has the owner opened the link, how long until it expires, and which page the shared tab is on now.")
+      def handoff_status():
+          h = _active()
+          engine_state = _engine("GET", "/session")
+          out = _handoff_public(h)
+          out["engine_active"] = bool(engine_state.get("active"))
+          if h:
+              out["tab"] = _tab_summary(h["tab_id"])
+              if not engine_state.get("active"):
+                  out["active"] = False
+                  out["detail"] = "the viewer stopped (expired or the engine restarted); start a new handoff if still needed"
+          return out
+
+
+      @tool("end_handoff",
+            "End the human handoff: revoke the link and stop the viewer. The browser, its tabs and the session stay as they are, so the agent resumes where the owner left off.")
+      def end_handoff():
+          with HANDOFF_LOCK:
+              had = bool(HANDOFF)
+              tab = HANDOFF.get("tab_id")
+              HANDOFF.clear()
+              r = _engine("DELETE", "/session")
+          return {"ok": True, "ended": had or bool(r.get("stopped")), "tab": _tab_summary(tab) if tab else None}
+
+
+      def _cookie_token(headers):
+          for part in headers.get("cookie", "").split(";"):
+              k, _, v = part.strip().partition("=")
+              if k == COOKIE:
+                  return v
+          return ""
+
+
+      def _authorized(headers):
+          h = _active()
+          return bool(h) and hmac.compare_digest(_cookie_token(headers).encode(), h["token"].encode())
+
+
+      def route(method, target, headers):
+          """Handoff viewer under /handoff/, DevTools for direct callers only, everything else unchanged."""
+          path, _, query = target.partition("?")
+          if path == HANDOFF_PREFIX:
+              return ("respond", 301, None, "Location: handoff/\r\n")
+          if path.startswith(HANDOFF_PREFIX + "/"):
+              rest = path[len(HANDOFF_PREFIX):]
+              if rest == "/state":
+                  h = _active()
+                  ok = _authorized(headers)
+                  if ok:
+                      h["seen_at"] = time.time()
+                  return ("respond", 200, {"active": bool(h), "authorized": ok}, "")
+              if rest == "/websockify" or rest.startswith("/control/"):
+                  if not _authorized(headers):
+                      return ("respond", 401, {"error": "this handoff link has ended or is not valid"}, "")
+                  h = HANDOFF
+                  h["seen_at"] = time.time()
+                  if rest == "/websockify":
+                      h["opened_at"] = h.get("opened_at") or time.time()
+                      auth = base64.b64encode(("handoff:" + h["ws_secret"]).encode()).decode()
+                      return ("proxy", UP_HOST, VNC_WS_PORT, "/websockify", ("cookie", "authorization"),
+                              ["Authorization: Basic " + auth])
+                  return ("proxy", UP_HOST, CONTROL_PORT, rest + ("?" + query if query else ""), ("cookie", "authorization"), [])
+              if method not in ("GET", "HEAD"):
+                  return ("respond", 405, {"error": "the viewer is read-only"}, "Allow: GET, HEAD\r\n")
+              return ("proxy", UP_HOST, CONTROL_PORT, rest, ("cookie", "authorization"), [])
+          # DevTools has no password. Other apps and the host call it directly; anything arriving through a
+          # reverse proxy (Tailscale Serve, the Wizard gateway) is a remote client and gets no DevTools.
+          if any(k in headers for k in PROXY_HEADERS):
+              return ("respond", 403, {"error": "DevTools is only for apps on this box; the owner's page is /handoff/"}, "")
+          return None
+
+
+      ROUTE = route
+
+
       if __name__ == "__main__":
           asyncio.run(main())
     # END MCP FRONT
@@ -361,7 +610,7 @@ services:
     x-runtipi:
       is_main: true
   browser-engine:
-    image: chromedp/headless-shell:155.0.8059.40@sha256:0dc9356ce1428962cddcf938dab712a8c56de79adc326f9138298f13df440071
+    image: ghcr.io/oscarhenrycollins/browser-engine:2.0.0
     user: 1000:1000
     read_only: true
     init: true
@@ -377,6 +626,8 @@ services:
     - /tmp:rw,nosuid,size=2g
     environment:
       HOME: /tmp
+      FRONT_HOST: browser
+      BROWSER_SCREEN: 500x900
 x-runtipi:
   schema_version: 2
   overrides: []

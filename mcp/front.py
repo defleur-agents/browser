@@ -25,6 +25,10 @@ MAX_HEAD = 65536
 MAX_BODY = 1 << 20
 TOOLS = {}
 REQUEST = contextvars.ContextVar("request", default={})  # headers of the current /mcp call
+# An app's tools.py may set ROUTE = fn(method, target, headers) to route a non-/mcp request itself.
+# It returns None (default pass-through), ("respond", code, obj, extra_headers) or
+# ("proxy", host, port, new_target, drop_header_names, add_header_lines).
+ROUTE = None
 
 
 def tool(name, description, props=None, required=()):
@@ -82,13 +86,15 @@ def rpc(msg):
     return {"jsonrpc": "2.0", "id": i, "result": r}
 
 
-REASONS = {200: "OK", 202: "Accepted", 400: "Bad Request", 404: "Not Found", 405: "Method Not Allowed",
-           401: "Unauthorized", 413: "Payload Too Large", 502: "Bad Gateway"}
+REASONS = {200: "OK", 202: "Accepted", 301: "Moved Permanently", 400: "Bad Request", 401: "Unauthorized",
+           403: "Forbidden", 404: "Not Found", 405: "Method Not Allowed", 409: "Conflict", 413: "Payload Too Large",
+           502: "Bad Gateway"}
 
 
 async def respond(writer, code, obj=None, extra=""):
     body = b"" if obj is None else json.dumps(obj).encode()
-    head = "HTTP/1.1 %d %s\r\nContent-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n%s\r\n" % (
+    head = ("HTTP/1.1 %d %s\r\nContent-Type: application/json\r\nContent-Length: %d\r\nCache-Control: no-store\r\n"
+            "Connection: close\r\n%s\r\n") % (
         code, REASONS.get(code, "OK"), len(body), extra)
     writer.write(head.encode() + body)
     try:
@@ -154,15 +160,33 @@ async def handle(reader, writer):
     path = parts[1].split("?", 1)[0] if len(parts) >= 3 else ""
     if path == MCP_PATH:
         return await mcp(reader, writer, parts[0], rest)
-    if not UP_HOST:
+    host, port = UP_HOST, UP_PORT
+    lines = head.decode("latin-1").split("\r\n")
+    if ROUTE and len(parts) >= 3:
+        headers = {}
+        for l in lines[1:]:
+            if ":" in l:
+                k, v = l.split(":", 1)
+                headers[k.strip().lower()] = v.strip()
+        try:
+            r = ROUTE(parts[0], parts[1], headers)
+        except Exception as e:  # a routing bug must not take the proxy down
+            r = ("respond", 502, {"error": "%s: %s" % (type(e).__name__, e)}, "")
+        if r and r[0] == "respond":
+            return await respond(writer, *r[1:])
+        if r and r[0] == "proxy":
+            _, host, port, target, drop, add = r
+            lines = ["%s %s %s" % (parts[0], target, parts[2])] + [
+                l for l in lines[1:] if l and l.split(":", 1)[0].strip().lower() not in drop] + list(add) + ["", ""]
+            head = "\r\n".join(lines).encode("latin-1")
+    if not host:
         return await respond(writer, 404, {"error": "not found"})
     try:
-        ur, uw = await asyncio.open_connection(UP_HOST, UP_PORT)
+        ur, uw = await asyncio.open_connection(host, port)
     except OSError:
         return await respond(writer, 502, {"error": "%s is starting or not reachable" % APP})
     # One request per proxied connection (unless it is an upgrade such as a WebSocket), so a
     # later /mcp request can never ride an upstream keep-alive connection.
-    lines = head.decode("latin-1").split("\r\n")
     if not any(l.lower().startswith("upgrade:") for l in lines):
         lines = [l for l in lines if l and not l.lower().startswith(("connection:", "keep-alive:"))]
         head = ("\r\n".join(lines) + "\r\nConnection: close\r\n\r\n").encode("latin-1")
