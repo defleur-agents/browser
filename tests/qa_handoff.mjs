@@ -4,6 +4,7 @@
 import { chromium } from 'playwright-core';
 import fs from 'node:fs';
 import path from 'node:path';
+import { execFileSync } from 'node:child_process';
 
 const BASE = (process.env.BASE || 'http://127.0.0.1:18793').replace(/\/$/, '');
 const OUT = process.env.OUT || './qa-out';
@@ -15,6 +16,10 @@ const check = (name, ok, detail) => {
   console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}${detail !== undefined ? '  ' + JSON.stringify(detail) : ''}`);
   if (!ok) { fs.writeFileSync(path.join(OUT, 'report.json'), JSON.stringify(report, null, 2)); process.exit(1); }
 };
+// Raw WebSocket-upgrade probe (fetch cannot send Connection/Upgrade): returns the HTTP status.
+const wsProbe = (cookie) => Number(execFileSync('curl', ['-s', '-o', '/dev/null', '-m', '5', '-w', '%{http_code}',
+  '-H', 'Connection: Upgrade', '-H', 'Upgrade: websocket', '-H', 'Sec-WebSocket-Version: 13', '-H', 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==',
+  ...(cookie ? ['-H', 'Cookie: browser_handoff=' + cookie] : []), `${BASE}/handoff/websockify`]).toString());
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 async function until(fn, ms = 5000, step = 100) {
   const end = Date.now() + ms;
@@ -70,8 +75,8 @@ const tab = status0.tabs.find((t) => t.title === 'Handoff fixture');
 check('browser_status sees the agent tab', tab, { tabs: status0.tabs.length, handoff: status0.handoff });
 const before = await tool('handoff_status');
 check('no handoff before start', before.active === false && before.engine_active === false, before);
-const ws0 = await fetch(`${BASE}/handoff/websockify`, { headers: { Connection: 'Upgrade', Upgrade: 'websocket' } });
-check('vnc websocket refused without a handoff', ws0.status === 401, ws0.status);
+const ws0 = wsProbe('');
+check('vnc websocket refused without a handoff', ws0 === 401, ws0);
 
 const started = await tool('start_handoff', { tab_id: tab.id, purpose: 'captcha', note: 'QA: tap I am human', ttl_s: 600 });
 check('start_handoff returns a capability link', started.ok && /\/handoff\/#[A-Za-z0-9]{32}$/.test(started.handoff_url || ''), { ...started, handoff_url: started.handoff_url && started.handoff_url.replace(/#.*/, '#<redacted>') , send_to_owner: '<redacted>' });
@@ -79,8 +84,8 @@ const again = await tool('start_handoff', { tab_id: tab.id });
 check('start_handoff is idempotent while open', again.reused === true && again.handoff_url === started.handoff_url, { reused: again.reused });
 const st1 = await tool('handoff_status');
 check('handoff_status: open, not yet opened by owner', st1.active && st1.engine_active && st1.owner_opened === false && st1.tab.id === tab.id, st1);
-const wsBad = await fetch(`${BASE}/handoff/websockify`, { headers: { Cookie: 'browser_handoff=' + 'x'.repeat(32) } });
-check('vnc websocket refused with a wrong capability', wsBad.status === 401, wsBad.status);
+const wsBad = wsProbe('x'.repeat(32));
+check('vnc websocket refused with a wrong capability', wsBad === 401, wsBad);
 
 // ---- (b) phone viewer ---------------------------------------------------------------------------------
 const phone = await chromium.launch({ headless: true, executablePath: CHROME });
@@ -172,8 +177,8 @@ const dropped = await until(() => viewer.evaluate(() => !document.documentElemen
 check('viewer disconnects after end_handoff', dropped === true);
 const after = await tool('handoff_status');
 check('handoff_status inactive after end', after.active === false && after.engine_active === false, after);
-const wsAfter = await fetch(`${BASE}/handoff/websockify`, { headers: { Cookie: 'browser_handoff=' + started.handoff_url.split('#')[1] } });
-check('old link refused after end', wsAfter.status === 401, wsAfter.status);
+const wsAfter = wsProbe(started.handoff_url.split('#')[1]);
+check('old link refused after end', wsAfter === 401, wsAfter);
 const resumed = await remote.evaluate(() => ({ email: document.getElementById('email').value, result: document.getElementById('result').textContent }));
 check('agent resumes in the same tab with the owner\'s input', resumed.email === 'owner@example.com' && resumed.result === 'passed', resumed);
 const read = await tool('read_page', { url: 'https://example.com/', wait_ms: 500 }).catch((e) => ({ error: String(e) }));
