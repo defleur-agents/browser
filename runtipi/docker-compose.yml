@@ -218,12 +218,58 @@ services:
               return await respond(writer, 502, {"error": "%s is starting or not reachable" % APP})
           # One request per proxied connection (unless it is an upgrade such as a WebSocket), so a
           # later /mcp request can never ride an upstream keep-alive connection.
-          if not any(l.lower().startswith("upgrade:") for l in lines):
-              lines = [l for l in lines if l and not l.lower().startswith(("connection:", "keep-alive:"))]
-              head = ("\r\n".join(lines) + "\r\nConnection: close\r\n\r\n").encode("latin-1")
-          uw.write(head)
+          if any(l.lower().startswith("upgrade:") for l in lines):
+              uw.write(head)
+              await uw.drain()
+              await asyncio.gather(pipe(reader, uw), pipe(ur, writer))
+              return
+          lines = [l for l in lines if l and not l.lower().startswith(("connection:", "keep-alive:"))]
+          uw.write(("\r\n".join(lines) + "\r\nConnection: close\r\n\r\n").encode("latin-1"))
           await uw.drain()
-          await asyncio.gather(pipe(reader, uw), pipe(ur, writer))
+          await relay_once(reader, writer, ur, uw, lines)
+
+
+      def _length(lines):
+          for l in lines:
+              if l.lower().startswith("content-length:"):
+                  try:
+                      return max(0, int(l.split(":", 1)[1].strip()))
+                  except ValueError:
+                      return None
+          return None
+
+
+      async def relay_once(reader, writer, ur, uw, req_lines):
+          """Exactly one request and one response, then close both sides: some upstreams (Chrome DevTools) ignore
+          Connection: close, and a client's next request on a kept-alive socket must reach /mcp, not the upstream."""
+          try:
+              n = _length(req_lines)
+              if n:
+                  uw.write(await reader.readexactly(n))
+                  await uw.drain()
+              elif any(l.lower().startswith("transfer-encoding:") for l in req_lines):
+                  asyncio.ensure_future(pipe(reader, uw))
+              head = await ur.readuntil(b"\r\n\r\n")
+              rlines = head.decode("latin-1").split("\r\n")
+              rlines = [l for l in rlines if l and not l.lower().startswith(("connection:", "keep-alive:"))]
+              writer.write(("\r\n".join(rlines) + "\r\nConnection: close\r\n\r\n").encode("latin-1"))
+              rn = _length(rlines[1:])
+              status = rlines[0].split(" ")[1] if len(rlines[0].split(" ")) > 1 else ""
+              if rn is not None or status in ("204", "304") or req_lines[0].startswith("HEAD "):
+                  if rn:
+                      writer.write(await ur.readexactly(rn))
+                  await writer.drain()
+              else:
+                  await writer.drain()
+                  await pipe(ur, writer)
+          except (asyncio.IncompleteReadError, asyncio.LimitOverrunError, ConnectionError, OSError):
+              pass
+          finally:
+              for w in (uw, writer):
+                  try:
+                      w.close()
+                  except Exception:
+                      pass
 
 
       async def main():

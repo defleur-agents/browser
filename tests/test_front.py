@@ -72,5 +72,42 @@ class RouteTests(unittest.TestCase):
         self.assertTrue({"start_handoff", "handoff_status", "end_handoff"} <= names)
 
 
+class KeepAliveTests(unittest.TestCase):
+    """A client reusing a kept-alive socket after a DevTools call must not have its /mcp call sent upstream."""
+
+    def test_second_request_on_socket_never_reaches_upstream(self):
+        import asyncio
+        f = load_front()
+        seen = []
+
+        async def upstream(reader, writer):  # like Chrome: ignores Connection: close, keeps the socket open
+            while True:
+                try:
+                    head = await reader.readuntil(b"\r\n\r\n")
+                except Exception:
+                    break
+                seen.append(head.split(b"\r\n", 1)[0])
+                writer.write(b"HTTP/1.1 200 OK\r\nContent-Length:2\r\nContent-Type:application/json\r\n\r\n{}")
+                await writer.drain()
+
+        async def run():
+            up = await asyncio.start_server(upstream, "127.0.0.1", 0)
+            f["UP_HOST"], f["UP_PORT"] = "127.0.0.1", up.sockets[0].getsockname()[1]
+            f["ROUTE"] = None
+            front = await asyncio.start_server(f["handle"], "127.0.0.1", 0)
+            r, w = await asyncio.open_connection("127.0.0.1", front.sockets[0].getsockname()[1])
+            w.write(b"GET /json/version HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+            w.write(b"POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 2\r\n\r\n{}")
+            await w.drain()
+            data = await asyncio.wait_for(r.read(), 5)
+            up.close()
+            front.close()
+            return data
+
+        data = asyncio.run(run())
+        self.assertIn(b"Connection: close", data)
+        self.assertEqual(seen, [b"GET /json/version HTTP/1.1"])
+
+
 if __name__ == "__main__":
     unittest.main()
