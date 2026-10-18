@@ -31,7 +31,7 @@ if root.exists():
 client.mkdir(parents=True)
 for name in ("app", "core", "vendor"):
     shutil.copytree(source / name, client / name)
-for name in ("vnc.html", "LICENSE.txt", "AUTHORS"):
+for name in ("vnc.html", "package.json", "LICENSE.txt", "AUTHORS"):  # ui.js reads package.json for its version
     shutil.copy2(source / name, client / name)
 shutil.copy2(Path(__file__).resolve().parent / "index.html", root / "index.html")
 
@@ -762,6 +762,25 @@ paste_css = '''
 '''
 if 'Tailnet Browser: compact, phone-friendly direct paste control.' not in css:
     css_path.write_text(css + paste_css, encoding='utf-8')
+
+# Browser app fix: noVNC hides its (unused here) control bar 2 s after connecting and then focuses the
+# canvas, which blurred a phone keyboard the owner had already opened on a remote field (the keyboard
+# closed and a typed letter was lost). Keep the keyboard when it is the focused element.
+ui_path = client / "app" / "ui.js"
+ui = ui_path.read_text(encoding="utf-8")
+stock_close = """        document.getElementById('noVNC_control_bar')
+            .classList.remove("noVNC_open");
+        UI.rfb.focus();
+    },"""
+kept_close = """        document.getElementById('noVNC_control_bar')
+            .classList.remove("noVNC_open");
+        if (document.activeElement !== document.getElementById('noVNC_keyboardinput')) {
+            UI.rfb.focus();
+        }
+    },"""
+if ui.count(stock_close) != 1:
+    raise SystemExit("Expected noVNC 1.3.0 closeControlbar was not found")
+ui_path.write_text(ui.replace(stock_close, kept_close, 1), encoding="utf-8")
 
 # Keep touch input on the real noVNC -> RFB -> X11 path (paced native taps).
 patch_rfb_taps(client / "core" / "rfb.js")

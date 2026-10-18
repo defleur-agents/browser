@@ -14,7 +14,7 @@ const report = { base: BASE, checks: {} };
 const check = (name, ok, detail) => {
   report.checks[name] = { ok: Boolean(ok), detail };
   console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}${detail !== undefined ? '  ' + JSON.stringify(detail) : ''}`);
-  if (!ok) { fs.writeFileSync(path.join(OUT, 'report.json'), JSON.stringify(report, null, 2)); process.exit(1); }
+  if (!ok) { fs.writeFileSync(path.join(OUT, 'report.json'), JSON.stringify(report, null, 2)); fetch(`${BASE}/mcp`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: 0, method: 'tools/call', params: { name: 'end_handoff', arguments: {} } }) }).finally(() => process.exit(1)); }
 };
 // Raw WebSocket-upgrade probe (fetch cannot send Connection/Upgrade): returns the HTTP status.
 const wsProbe = (cookie) => Number(execFileSync('curl', ['-s', '-o', '/dev/null', '-m', '5', '-w', '%{http_code}',
@@ -138,9 +138,10 @@ const focused = await until(() => remote.evaluate(() => document.activeElement &
 check('a tap on the phone focuses the remote field', focused === true);
 const autoKb = await until(() => viewer.evaluate(() => document.activeElement && document.activeElement.id === 'noVNC_keyboardinput'));
 check('Keyboard opens by itself on an editable remote field', autoKb === true, { focusedEditableProbes: editableProbes.length });
-await viewer.keyboard.type('owner@example.com', { delay: 40 });
-const typed = await until(async () => { const v = await remote.evaluate(() => document.getElementById('email').value); return v === 'owner@example.com' ? v : null; }, 8000);
-check('typing on the phone keyboard reaches the remote field', typed === 'owner@example.com', typed);
+await viewer.keyboard.type('owner@example.com', { delay: Number(process.env.TYPE_DELAY_MS || 60) });
+await until(async () => (await remote.evaluate(() => document.getElementById('email').value)) === 'owner@example.com', 8000);
+const typed = await remote.evaluate(() => ({ value: document.getElementById('email').value, focused: document.activeElement && document.activeElement.id }));
+check('typing on the phone keyboard reaches the remote field', typed.value === 'owner@example.com', typed);
 await viewer.screenshot({ path: path.join(OUT, 'viewer-keyboard.png') });
 
 // Keyboard button toggles the keyboard closed and open again
@@ -184,7 +185,9 @@ check('agent resumes in the same tab with the owner\'s input', resumed.email ===
 const read = await tool('read_page', { url: 'https://example.com/', wait_ms: 500 }).catch((e) => ({ error: String(e) }));
 check('existing read_page tool still works', typeof read.title === 'string' && read.title.length > 0, { title: read.title, error: read.error });
 
-await phone.close();  // the agent connection is left open: closing a CDP-connected browser would close Chromium
+await phone.close();
+await remote.close();  // the shared Chromium itself stays up (connectOverCDP + close() would end it)
 report.status = 'PASS';
 fs.writeFileSync(path.join(OUT, 'report.json'), JSON.stringify(report, null, 2));
 console.log('ALL PASS');
+process.exit(0);
