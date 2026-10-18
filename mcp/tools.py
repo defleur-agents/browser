@@ -266,7 +266,7 @@ def start_handoff(url=None, tab_id=None, purpose="other", note="", ttl_s=900, ba
                 tab_id = _devtools("/json/new?about:blank", "PUT")["id"]
             else:
                 tab_id = tabs[0]["id"]
-        _devtools("/json/activate/" + tab_id)
+        http("GET", "/json/activate/" + tab_id, timeout=10)  # plain-text reply, not JSON
         token, ws_secret = _secret(32), _secret(32)
         _engine("POST", "/session", {"password": token[:8], "ws_secret": ws_secret, "ttl": ttl})
         now = time.time()
