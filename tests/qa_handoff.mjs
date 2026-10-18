@@ -80,7 +80,7 @@ const ws0 = wsProbe('');
 check('vnc websocket refused without a handoff', ws0 === 401, ws0);
 
 const started = await tool('start_handoff', { tab_id: tab.id, purpose: 'captcha', note: 'QA: tap I am human', ttl_s: 600 });
-check('start_handoff returns a capability link', started.ok && /\/handoff\/#[A-Za-z0-9]{32}$/.test(started.handoff_url || ''), { ...started, handoff_url: started.handoff_url && started.handoff_url.replace(/#.*/, '#<redacted>') , send_to_owner: '<redacted>' });
+check('start_handoff returns a capability link', started.ok && /\/handoff\/#[A-Za-z0-9]{32}$/.test(started.handoff_url || ''), { ...started, handoff_url: started.handoff_url && started.handoff_url.replace(/#.*/, '#<redacted>'), handoff_path: '/handoff/#<redacted>', send_to_owner: '<redacted>' });
 const again = await tool('start_handoff', { tab_id: tab.id });
 check('start_handoff is idempotent while open', again.reused === true && again.handoff_url === started.handoff_url, { reused: again.reused });
 const st1 = await tool('handoff_status');
