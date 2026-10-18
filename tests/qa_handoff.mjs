@@ -49,7 +49,8 @@ button{display:block;width:90%;margin:20px 5%;height:64px;font-size:20px}.spacer
 <p id="result">waiting</p><div class="spacer"></div></body></html>`;
 
 // ---- (a) DevTools compatibility on the app port ----------------------------------------------------
-const version = await (await fetch(`${BASE}/json/version`)).json();
+const getVersion = async () => { try { const r = await fetch(`${BASE}/json/version`); return r.ok ? await r.json() : null; } catch { return null; } };
+const version = await until(getVersion, 60000, 500);
 check('cdp /json/version answers', version.Browser && version.webSocketDebuggerUrl, { Browser: version.Browser });
 const wsHost = new URL(version.webSocketDebuggerUrl).host;
 check('webSocketDebuggerUrl points back at the app port (Hermes browser.cdp_url resolution)', wsHost === new URL(BASE).host, version.webSocketDebuggerUrl);
@@ -191,8 +192,11 @@ await remote.close();
 // A client that closes the whole browser (puppeteer browser.close()) must not take the app down.
 const cdp = await agent.newBrowserCDPSession();
 await cdp.send('Browser.close').catch(() => {});
-const back = await until(async () => { try { return (await fetch(`${BASE}/json/version`)).ok; } catch { return false; } }, 60000, 500);
-check('Chromium restarts after a client calls Browser.close', back === true);
+const back = await until(async () => { const v = await getVersion(); return v && v.webSocketDebuggerUrl !== version.webSocketDebuggerUrl ? v : null; }, 60000, 500);
+await sleep(1500);
+const stable = await getVersion();
+check('Chromium restarts after a client calls Browser.close', back && stable && stable.webSocketDebuggerUrl === back.webSocketDebuggerUrl,
+  { before: version.webSocketDebuggerUrl, after: back && back.webSocketDebuggerUrl });
 report.status = 'PASS';
 fs.writeFileSync(path.join(OUT, 'report.json'), JSON.stringify(report, null, 2));
 console.log('ALL PASS');
