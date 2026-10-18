@@ -106,6 +106,13 @@ def tcp_open(port):
 
 def start_xvfb():
     w, h = SCREEN.lower().split("x")
+    # Xvfb refuses to create its socket directory when not root; /tmp is a fresh tmpfs, so make it here.
+    xdir = Path("/tmp/.X11-unix")
+    xdir.mkdir(exist_ok=True)
+    try:
+        xdir.chmod(0o1777)
+    except OSError:
+        pass
     p = Proc("xvfb", ["Xvfb", DISPLAY, "-screen", "0", "%sx%sx24" % (w, h), "-nolisten", "tcp", "-dpi", "96"]).start()
     sock = Path("/tmp/.X11-unix/X" + DISPLAY.lstrip(":"))
     wait_for(sock.exists, 15, "Xvfb")
@@ -149,7 +156,11 @@ def start_chromium():
         except FileNotFoundError:
             pass
     p = Proc("chromium", chromium_argv(), x_env()).start()
-    wait_for(lambda: urllib.request.urlopen(CDP_HTTP + "/json/version", timeout=1).status == 200, 45, "Chromium DevTools")
+    try:
+        wait_for(lambda: urllib.request.urlopen(CDP_HTTP + "/json/version", timeout=1).status == 200, 45, "Chromium DevTools")
+    except RuntimeError:
+        p.stop()
+        raise
     return p
 
 
@@ -524,8 +535,8 @@ class Control(BaseHTTPRequestHandler):
 
 def main():
     RUNTIME.mkdir(mode=0o700, parents=True, exist_ok=True)
-    xvfb = start_xvfb()
-    chrome = start_chromium()
+    xvfb = None
+    # DevTools forwarder and control server first: /health answers while Chromium starts.
     threading.Thread(target=serve_cdp_forwarder, daemon=True).start()
     control = ThreadingHTTPServer(("0.0.0.0", CONTROL_PORT), Control)
     control.daemon_threads = True
@@ -539,23 +550,35 @@ def main():
     signal.signal(signal.SIGTERM, on_signal)
     signal.signal(signal.SIGINT, on_signal)
 
-    while not stopping.wait(1):
-        if not xvfb.alive():
-            log("Xvfb exited; restarting the display and the browser")
+    chrome = None
+    while True:
+        if xvfb is None or not xvfb.alive():
+            log("starting the display and the browser")
             HANDOFF.stop()
-            chrome.stop()
-            xvfb = start_xvfb()
-            chrome = start_chromium()
-        elif not chrome.alive():
-            log("Chromium exited (a client may have called Browser.close); restarting it")
+            if chrome:
+                chrome.stop()
+            chrome = None
+            try:
+                xvfb = start_xvfb()
+            except RuntimeError as exc:
+                log(exc)
+                xvfb = None
+        if xvfb is not None and (chrome is None or not chrome.alive()):
+            if chrome is not None:
+                log("Chromium exited (a client may have called Browser.close); restarting it")
             try:
                 chrome = start_chromium()
             except RuntimeError as exc:
                 log(exc)
+                chrome = None
         HANDOFF.reap()
+        if stopping.wait(1):
+            break
     HANDOFF.stop()
-    chrome.stop()
-    xvfb.stop()
+    if chrome:
+        chrome.stop()
+    if xvfb:
+        xvfb.stop()
 
 
 if __name__ == "__main__":

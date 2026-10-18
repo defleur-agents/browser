@@ -186,7 +186,13 @@ const read = await tool('read_page', { url: 'https://example.com/', wait_ms: 500
 check('existing read_page tool still works', typeof read.title === 'string' && read.title.length > 0, { title: read.title, error: read.error });
 
 await phone.close();
-await remote.close();  // the shared Chromium itself stays up (connectOverCDP + close() would end it)
+await remote.close();
+
+// A client that closes the whole browser (puppeteer browser.close()) must not take the app down.
+const cdp = await agent.newBrowserCDPSession();
+await cdp.send('Browser.close').catch(() => {});
+const back = await until(async () => { try { return (await fetch(`${BASE}/json/version`)).ok; } catch { return false; } }, 60000, 500);
+check('Chromium restarts after a client calls Browser.close', back === true);
 report.status = 'PASS';
 fs.writeFileSync(path.join(OUT, 'report.json'), JSON.stringify(report, null, 2));
 console.log('ALL PASS');
